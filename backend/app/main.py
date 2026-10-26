@@ -1,11 +1,20 @@
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
+# Ensure root backend directory is in sys.path so 'python main.py' works directly
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
 from app.api import api_router
 from app.config.settings import settings
+from app.database.session import engine
 from app.middleware.correlation import CorrelationAndLoggingMiddleware, CorrelationIdFilter
 
 # Configure structured logging with correlation IDs
@@ -29,8 +38,15 @@ logger = logging.getLogger("codepilot.main")
 async def lifespan(app: FastAPI):
     """Lifecycle event handler for the FastAPI application."""
     logger.info(f"Starting {settings.PROJECT_NAME} v{settings.VERSION}")
+    # Ensure storage directories exist
+    for dir_path in [settings.GENERATED_PROJECTS_DIR, settings.IMPORTED_REPOS_DIR, settings.FAISS_INDEXES_DIR]:
+        os.makedirs(dir_path, exist_ok=True)
     yield
     logger.info(f"Shutting down {settings.PROJECT_NAME} gracefully")
+    try:
+        engine.dispose()
+    except Exception:
+        pass
 
 
 app = FastAPI(
@@ -75,4 +91,4 @@ def root_status():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("app.main:app", host="127.0.0.1", port=8000, reload=True)
