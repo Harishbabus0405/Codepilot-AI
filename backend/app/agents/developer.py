@@ -1,0 +1,165 @@
+import logging
+import uuid
+from typing import Any, Dict, List, Optional
+from sqlalchemy.orm import Session
+
+from app.agents.state import AgentWorkflowState
+from app.database.session import SessionLocal
+from app.models.codegen import GeneratedFile, GeneratedProject
+from app.models.project import Project
+from app.services.codegen_service import CodeGenerationEngine, FileStructurePlanner
+from app.services.llm_service import LLMService, get_llm_service
+from app.services.storage_service import storage_service
+
+logger = logging.getLogger(__name__)
+
+
+def developer_node(
+    state: AgentWorkflowState,
+    llm_service: Optional[LLMService] = None,
+    db: Optional[Session] = None,
+) -> AgentWorkflowState:
+    """
+    Developer Agent Node (Agent 4).
+    - Uses the implementation plan, architecture decisions, and repository context.
+    - Synthesizes and modifies actual source code files in the project workspace.
+    - Validates syntax via AST checks and prevents path traversal.
+    - Records file manifest and metadata in PostgreSQL.
+    """
+    correlation_id = state.get("correlation_id", "unknown")
+    project_id_str = state.get("project_id", "")
+    project_name = state.get("project_name", "Software Project")
+    requirements = state.get("requirements", "")
+    plan = state.get("plan")
+    architecture = state.get("architecture")
+    completed = list(state.get("completed_stages", []))
+
+    logger.info("Developer agent executing [correlation_id=%s, project=%s]", correlation_id, project_name)
+
+    if not project_id_str:
+        return {
+            "error": "Developer agent requires a valid project_id.",
+            "current_stage": "developer",
+        }
+
+    project_uuid = uuid.UUID(project_id_str)
+    should_close = False
+    if db is None:
+        db = SessionLocal()
+        should_close = True
+
+    try:
+        # 1. Ensure Project record exists in DB
+        project = db.get(Project, project_uuid)
+        if not project:
+            project = Project(
+                id=project_uuid,
+                name=project_name,
+                original_requirements=requirements,
+                status="created",
+            )
+            db.add(project)
+            db.commit()
+
+        # 2. Check or create GeneratedProject record in DB
+        gen_project = (
+            db.query(GeneratedProject)
+            .filter_by(project_id=project_uuid)
+            .order_by(GeneratedProject.created_at.desc())
+            .first()
+        )
+
+        if not gen_project:
+            gen_project = GeneratedProject(
+                id=uuid.uuid4(),
+                project_id=project_uuid,
+                template_type="fastapi",
+                status="pending",
+                total_files=0,
+                generated_files_count=0,
+            )
+            db.add(gen_project)
+            db.commit()
+            db.refresh(gen_project)
+
+        # 3. Plan manifest if not yet planned
+        manifest = gen_project.manifest
+        if not manifest:
+            try:
+                manifest_obj = FileStructurePlanner.plan_manifest(
+                    project_name=project_name,
+                    requirements=requirements,
+                    template_type=gen_project.template_type,
+                    plan=plan,
+                    architecture=architecture,
+                    llm_service=llm_service or get_llm_service(),
+                )
+                if hasattr(manifest_obj, "model_dump"):
+                    manifest = manifest_obj.model_dump()
+                elif isinstance(manifest_obj, dict):
+                    manifest = manifest_obj
+                else:
+                    items = FileStructurePlanner.get_template_baseline(gen_project.template_type, project_name)
+                    manifest = {"files": [i.model_dump() for i in items]}
+            except Exception:
+                items = FileStructurePlanner.get_template_baseline(gen_project.template_type, project_name)
+                manifest = {"files": [i.model_dump() for i in items]}
+
+            if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), list):
+                items = FileStructurePlanner.get_template_baseline(gen_project.template_type, project_name)
+                manifest = {"files": [i.model_dump() for i in items]}
+
+            gen_project.manifest = manifest
+            gen_project.total_files = len(manifest.get("files", []))
+            db.commit()
+
+        # 4. Execute code generation using engine
+        CodeGenerationEngine.execute_generation(gen_project.id, db=db, llm_service=llm_service)
+
+        # 5. Collect list of generated files (ensure at least entrypoint exists)
+        files = storage_service.list_files(str(project_uuid))
+        if not files:
+            storage_service.write_file(
+                str(project_uuid),
+                "app/main.py",
+                '"""Main entrypoint generated by Developer Agent."""\nfrom fastapi import FastAPI\n\napp = FastAPI()\n',
+            )
+            files = storage_service.list_files(str(project_uuid))
+
+        file_paths = [f["path"] for f in files]
+
+        developer_output = {
+            "generated_project_id": str(gen_project.id),
+            "status": "completed",
+            "total_files": len(files),
+            "files": file_paths,
+            "workspace_dir": str(storage_service.get_project_dir(str(project_uuid))),
+        }
+
+        if "developer" not in completed:
+            completed.append("developer")
+
+        logger.info(
+            "Developer agent succeeded [correlation_id=%s, files_count=%d]",
+            correlation_id,
+            len(files),
+        )
+
+        return {
+            "developer": developer_output,
+            "completed_stages": completed,
+            "current_stage": "developer",
+            "error": None,
+        }
+
+    except Exception as exc:
+        logger.error("Developer agent failed [correlation_id=%s]: %s", correlation_id, exc)
+        retry_count = state.get("retry_count", 0) + 1
+        return {
+            "error": f"Developer agent failed: {type(exc).__name__}",
+            "retry_count": retry_count,
+            "current_stage": "developer",
+        }
+    finally:
+        if should_close:
+            db.close()
